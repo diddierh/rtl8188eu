@@ -19,6 +19,7 @@
  ******************************************************************************/
 #define _OS_INTFS_C_
 
+#include <linux/version.h>
 #include <osdep_service.h>
 #include <drv_types.h>
 #include <xmit_osdep.h>
@@ -30,6 +31,7 @@
 #include <usb_osintf.h>
 #include <usb_hal.h>
 #include <rtw_br_ext.h>
+#include <linux/version.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Realtek Wireless Lan Driver");
@@ -242,7 +244,6 @@ void rtw_proc_init_one(struct net_device *dev)
 		return;
 	}
 	entry->write_proc = proc_set_read_reg;
-
 
 	entry = create_proc_read_entry("fwstate", S_IFREG | S_IRUGO,
 				   dir_dev, proc_get_fwstate, dev);
@@ -520,8 +521,6 @@ static uint loadparam(struct adapter *padapter,  struct  net_device *pnetdev)
 	uint status = _SUCCESS;
 	struct registry_priv  *registry_par = &padapter->registrypriv;
 
-_func_enter_;
-
 	GlobalDebugLevel = rtw_debug;
 	registry_par->chip_version = (u8)rtw_chip_version;
 	registry_par->rfintfs = (u8)rtw_rfintfs;
@@ -588,7 +587,7 @@ _func_enter_;
 	snprintf(registry_par->ifname, 16, "%s", ifname);
 	snprintf(registry_par->if2name, 16, "%s", if2name);
 	registry_par->notch_filter = (u8)rtw_notch_filter;
-_func_exit_;
+
 	return status;
 }
 
@@ -652,7 +651,14 @@ static unsigned int rtw_classify8021d(struct sk_buff *skb)
 	return dscp >> 5;
 }
 
-static u16 rtw_select_queue(struct net_device *dev, struct sk_buff *skb)
+static u16 rtw_select_queue(struct net_device *dev, struct sk_buff *skb
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
+			    ,void *unused
+                            ,select_queue_fallback_t fallback
+#elif (LINUX_VERSION_CODE == KERNEL_VERSION(3, 13, 0))
+			    , void *accel
+#endif
+)
 {
 	struct adapter	*padapter = rtw_netdev_priv(dev);
 	struct mlme_priv *pmlmepriv = &padapter->mlmepriv;
@@ -707,9 +713,15 @@ int rtw_init_netdev_name(struct net_device *pnetdev, const char *ifname)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,39)
 static const struct device_type wlan_type = {
 	.name = "wlan",
 };
+#else
+static struct device_type wlan_type = {
+	.name = "wlan",
+};
+#endif
 
 struct net_device *rtw_init_netdev(struct adapter *old_padapter)
 {
@@ -761,7 +773,7 @@ void rtw_stop_drv_threads(struct adapter *padapter)
 	RT_TRACE(_module_os_intfs_c_, _drv_info_, ("+rtw_stop_drv_threads\n"));
 
 	/* Below is to termindate rtw_cmd_thread & event_thread... */
-	_rtw_up_sema(&padapter->cmdpriv.cmd_queue_sema);
+	up(&padapter->cmdpriv.cmd_queue_sema);
 	if (padapter->cmdThread)
 		_rtw_down_sema(&padapter->cmdpriv.terminate_cmdthread_sema);
 
@@ -853,8 +865,7 @@ u8 rtw_reset_drv_sw(struct adapter *padapter)
 u8 rtw_init_drv_sw(struct adapter *padapter)
 {
 	u8	ret8 = _SUCCESS;
-
-_func_enter_;
+	unsigned long flags;
 
 	RT_TRACE(_module_os_intfs_c_, _drv_info_, ("+rtw_init_drv_sw\n"));
 
@@ -924,12 +935,12 @@ _func_enter_;
 
 	rtw_hal_sreset_init(padapter);
 
-	_rtw_spinlock_init(&padapter->br_ext_lock);
+	spin_lock_init(&padapter->br_ext_lock);
 
 exit:
 	RT_TRACE(_module_os_intfs_c_, _drv_info_, ("-rtw_init_drv_sw\n"));
 
-	_func_exit_;
+	
 
 	return ret8;
 }
@@ -977,7 +988,6 @@ u8 rtw_free_drv_sw(struct adapter *padapter)
 	}
 	#endif
 
-
 	_rtw_spinlock_free(&padapter->br_ext_lock);
 
 	free_mlme_ext_priv(&padapter->mlmeextpriv);
@@ -1020,7 +1030,11 @@ void netdev_br_init(struct net_device *netdev)
 
 	rcu_read_lock();
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,36)
 	if (rcu_dereference(adapter->pnetdev->rx_handler_data)) {
+#else
+	if (rcu_dereference(adapter->pnetdev->br_port)) {
+#endif
 		struct net_device *br_netdev;
 		struct net *devnet = NULL;
 
@@ -1153,11 +1167,10 @@ netdev_open_error:
 	return _FAIL;
 }
 
-
 int rtw_ips_pwr_up(struct adapter *padapter)
 {
 	int result;
-	u32 start_time = rtw_get_current_time();
+	u32 start_time = jiffies;
 	DBG_88E("===>  rtw_ips_pwr_up..............\n");
 	rtw_reset_drv_sw(padapter);
 
@@ -1171,7 +1184,7 @@ int rtw_ips_pwr_up(struct adapter *padapter)
 
 void rtw_ips_pwr_down(struct adapter *padapter)
 {
-	u32 start_time = rtw_get_current_time();
+	u32 start_time = jiffies;
 	DBG_88E("===> rtw_ips_pwr_down...................\n");
 
 	padapter->bCardDisableWOHSM = true;
@@ -1212,6 +1225,7 @@ int pm_netdev_open(struct net_device *pnetdev, u8 bnormal)
 int netdev_close(struct net_device *pnetdev)
 {
 	struct adapter *padapter = (struct adapter *)rtw_netdev_priv(pnetdev);
+	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
 
 	RT_TRACE(_module_os_intfs_c_, _drv_info_, ("+88eu_drv - drv_close\n"));
 
@@ -1249,6 +1263,9 @@ int netdev_close(struct net_device *pnetdev)
 #ifdef CONFIG_88EU_P2P
 	rtw_p2p_enable(padapter, P2P_ROLE_DISABLE);
 #endif /* CONFIG_88EU_P2P */
+
+	kfree(dvobj->firmware.szFwBuffer);
+	dvobj->firmware.szFwBuffer = NULL;
 
 	RT_TRACE(_module_os_intfs_c_, _drv_info_, ("-88eu_drv - drv_close\n"));
 	DBG_88E("-88eu_drv - drv_close, bup =%d\n", padapter->bup);
